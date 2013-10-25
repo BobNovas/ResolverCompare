@@ -1,0 +1,14 @@
+novas.us SPF
+novas.us A
+novas.us SOA
+novas.us NS
+superawesum.novas.us A
+superawesum.novas.us SOA
+superawesum.novas.us NS
+shinkuro.com a
+shinkuro.com soa
+shinkuro.com ns
+com. ns 
+org. ns
+guideworks.tv soa
+version.bind TXT CH
