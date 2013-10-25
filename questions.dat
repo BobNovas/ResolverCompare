@@ -8,7 +8,7 @@ superawesum.novas.us NS
 shinkuro.com a
 shinkuro.com soa
 shinkuro.com ns
-com. ns 
+com. ns
 org. ns
 guideworks.tv soa
-version.bind TXT CH
+#version.bind TXT CH

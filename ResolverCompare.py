@@ -43,6 +43,7 @@ from difflib import Differ
 import os
 import string
 import sys
+import time
 from optparse import OptionParser, NO_DEFAULT
 
 from dns.message import Message
@@ -54,6 +55,7 @@ from dns import rdatatype
 
 from rrSetSource import RRSetSource
 
+rtt_stats = []
 
 def usage():
     print("\nusage: %s -r <Resolver_1_ip>[/bind_ip] -r <Resolver_2_ip>[/bind_ip] [-y/-side-by-side] [-q/--quiet] [-t/--ttl_tolerance <tolerance>] <questions-file>\n"
@@ -150,32 +152,85 @@ def main():
         lineno += 1
 
         results = []
+        rtt_time = []
         for resolver, source_ip in zip(resolvers, source_ips):
 
             try:
+                start_time = time.time()
                 result = resolver.query(name, rdtype, rdclass, source=source_ip, raise_on_no_answer=False)
+                end_time = time.time()
+
                 results.append(result)
+                rtt_time.append(end_time - start_time)
 
             except NXDOMAIN, nxd:
                 results.append(nxd)
+                rtt_time.append(-1)
             except YXDOMAIN, yxd:
                 results.append(yxd)
+                rtt_time.append(-1)
             except NoAnswer, noa:
                 results.append(noa)
+                rtt_time.append(-1)
             except Timeout, tmo:
                 results.append(tmo)
+                rtt_time.append(-1)
             except NoNameservers, nns:
                 results.append(nns)
+                rtt_time.append(-1)
 
-        compare(Question(lineno, name, rdclass, rdtype), (resolvers[0], results[0]), (resolvers[1], results[1]), ttl_tolerance, verbose, side_by_side)
+        compare(Question(lineno, name, rdclass, rdtype),
+                (resolvers[0], results[0], rtt_time[0]),
+                (resolvers[1], results[1], rtt_time[1]),
+                ttl_tolerance,
+                verbose,
+                side_by_side)
 
-    x = results[0]
+        rtt_stats.append(rtt_time)
+
+    report_rtt_stats(resolver_ips)
+
 
 def compare(q, t1, t2, ttl_tolerance, verbose, side_by_side):
     """
     use ResultHolder's to hold the results and compare them
     """
     ResultHolder(q, *t1).compare(ResultHolder(q, *t2), ttl_tolerance, verbose, side_by_side)
+
+def report_rtt_stats(resolver_ips):
+
+    n_resolvers = len(resolver_ips)
+
+    rtt_mins = []
+    rtt_maxs = []
+    rtt_sums = []
+    rtt_n = []
+
+    for resolver_inx in range(n_resolvers):
+
+        rtt_mins.append(1000000000.0)
+        rtt_maxs.append(0.0)
+        rtt_sums.append(0.0)
+        rtt_n.append(0)
+
+        for stat_tuple in rtt_stats:
+
+            if stat_tuple[resolver_inx] != -1:
+                rtt_mins[resolver_inx] = min(rtt_mins[resolver_inx], stat_tuple[resolver_inx])
+                rtt_maxs[resolver_inx] = max(rtt_maxs[resolver_inx], stat_tuple[resolver_inx])
+                rtt_sums[resolver_inx] += stat_tuple[resolver_inx]
+                rtt_n[resolver_inx] += 1
+
+    rpt = ''
+    for resolver_inx in range(n_resolvers):
+        rpt += ("%s min/avg/max = %d/%d/%d msec, " %
+              (resolver_ips[resolver_inx],
+               _ms(rtt_mins[resolver_inx]),
+               _ms(rtt_sums[resolver_inx]/rtt_n[resolver_inx]),
+               _ms(rtt_maxs[resolver_inx]), ))
+
+    print("round trip times: %s" % (rpt[:-2], ))
+
 
 class Question(object):
     """
@@ -195,10 +250,11 @@ class ResultHolder(object):
     """
     hold everything there is about a result - the question, the resolver, and the result
     """
-    def __init__(self, question, resolver, result):
+    def __init__(self, question, resolver, result, rtt_time):
         self.question = question
         self.resolver = resolver
         self.result = result
+        self.rtt_time = rtt_time
 
     def summary(self):
         if isinstance(self.result, DNSException):
@@ -239,7 +295,7 @@ class ResultHolder(object):
             #if at least one result has an answer section, ...
             if len(my_answ_rrsets) != 0 or len(other_answ_rrsets) != 0:
                 # compare the answer sections
-                return self.compare_section(my_answ_rrsets, other_answ_rrsets, ttl_tolerance, verbose, side_by_side)
+                return self.compare_section(other, my_answ_rrsets, other_answ_rrsets, ttl_tolerance, verbose, side_by_side)
 
             else:
                 #otherwise, compare the authority sections
@@ -247,13 +303,13 @@ class ResultHolder(object):
                 my_auth_rrsets = my_auth.list_rrsets()
                 other_auth = RRSetSource(other_response.authority)
                 other_auth_rrsets = other_auth.list_rrsets()
-                return self.compare_section(my_auth_rrsets, other_auth_rrsets, ttl_tolerance, verbose, side_by_side)
+                return self.compare_section(other, my_auth_rrsets, other_auth_rrsets, ttl_tolerance, verbose, side_by_side)
 
         else:
             raise ValueError("oops-program error...")
 
 
-    def compare_section(self, my_rrsets, other_rrsets, ttl_tolerance, verbose, side_by_side):
+    def compare_section(self, other, my_rrsets, other_rrsets, ttl_tolerance, verbose, side_by_side):
         """
         Compare the RRsets in one section to the RRsets in another section
         """
@@ -279,8 +335,8 @@ class ResultHolder(object):
                     if abs(my_rrset.ttl - other_rrset.ttl) > ttl_tolerance:
                         txt_rdtype = rdatatype.to_text(my_rrset.rdtype)
                         if not side_by_side:
-                            self.report("Equal but TTL of %s rrset differs (%d!=%d)"
-                                        % (txt_rdtype, my_rrset.ttl, other_rrset.ttl, ))
+                            self.report("Equal but TTL of %s rrset differs (%d!=%d), rtt=%d/%d"
+                                        % (txt_rdtype, my_rrset.ttl, other_rrset.ttl, _ms(self.rtt_time), _ms(other.rtt_time), ))
                         ttls_match = False
                         break
 
@@ -289,21 +345,20 @@ class ResultHolder(object):
                     self.report_side_by_side(my_rrsets, other_rrsets)
                 else:
                     if verbose:
-                        self.report("Equal (Size=%d)" % (N, ))
+                        self.report("Equal (Size=%d, rtt=%d/%d)" % (N, _ms(self.rtt_time), _ms(other.rtt_time), ))
             else:
                 if not ttls_match or verbose:
-                    self.report("Equal (Size=%d)" % (N, ))
+                    self.report("Equal (Size=%d, rtt=%d/%d)" % (N, _ms(self.rtt_time), _ms(other.rtt_time), ))
 
         else:
             # the RRsets differ
             if side_by_side:
                 self.report_side_by_side(my_rrsets, other_rrsets)
             else:
-                self.report("Differ: Size=%d, Equal: %d, Differ: %d" % (N, Same, Diff, ))
+                self.report("Differ: Size=%d, Equal: %d, Differ: %d, rtt=%d/%d" % (N, Same, Diff, _ms(self.rtt_time), _ms(other.rtt_time)))
 
     def report(self, message):
         print("%s, %s" % (self.question, message, ))
-
 
     def report_side_by_side(self, my_rrsets, other_rrsets):
         """
@@ -343,6 +398,10 @@ class ResultHolder(object):
                         print(fmt % (question, "", line))
                     question = ""
 
+def _ms(time_in_seconds):
+    return int((time_in_seconds + .0005) *1000)
+
+
 def test():
     """
     """
@@ -371,11 +430,11 @@ def test():
     line_no += 1
     response = dns.message.from_text(shinkuro_dot_com_ns)
     result = mkDNSAnswer(response)
-    rh1 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result)
+    rh1 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result, 0.1)
     response_2 = dns.message.from_text(shinkuro_dot_com_ns)
     del response_2.answer[0][0]
     result_2 = mkDNSAnswer(response_2)
-    rh2 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result_2)
+    rh2 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result_2, 0.2)
     rh1.compare(rh2, -1, True, True)
 
     # test 2: 2 missing RRs, one each side
@@ -383,11 +442,11 @@ def test():
     response = dns.message.from_text(shinkuro_dot_com_ns)
     del response.answer[0][1]
     result = mkDNSAnswer(response)
-    rh1 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result)
+    rh1 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result, 0.1)
     response_2 = dns.message.from_text(shinkuro_dot_com_ns)
     del response_2.answer[0][0]
     result_2 = mkDNSAnswer(response_2)
-    rh2 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result_2)
+    rh2 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result_2, 0.2)
     rh1.compare(rh2, -1, True, True)
 
     # test 3: differing SOA
@@ -396,10 +455,10 @@ def test():
 
     response = dns.message.from_text(shinkuro_dot_com_soa)
     result = mkDNSAnswer(response)
-    rh1 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result)
+    rh1 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result, 0.2)
     response_2 = dns.message.from_text(shinkuro_dot_com_soa.replace('2013100801', '2013100200'))
     result_2 = mkDNSAnswer(response_2)
-    rh2 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result_2)
+    rh2 = ResultHolder(mkQuestion(line_no, response.question[0]), None, result_2, 0.3)
     rh1.compare(rh2, -1, True, True)
 
 if __name__ == "__main__":
